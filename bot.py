@@ -1,15 +1,15 @@
 import os
-import psycopg2
 import json
+import psycopg2
+from datetime import datetime, timedelta
+from dateutil import parser
 from dotenv import load_dotenv
 from slack_bolt import App
 from groq import Groq
-from dateutil import parser
-from datetime import datetime, timedelta
 
-# -------------------------
-# LOAD ENV
-# -------------------------
+# ==============================
+# Load Environment Variables
+# ==============================
 load_dotenv()
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
@@ -17,24 +17,22 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-print("🚀 Slack Hybrid Bot Starting...")
-print("Database URL:", DATABASE_URL)
-
+# ==============================
+# Initialize Slack & Groq
+# ==============================
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# -------------------------
-# DATABASE CONNECTION
-# -------------------------
+# ==============================
+# Database Connection
+# ==============================
 def get_connection():
     return psycopg2.connect(DATABASE_URL)
 
-# -------------------------
-# ROLE CHECK USING SLACK ID
-# -------------------------
-def is_manager_by_slack_id(slack_user_id):
-    print("🔎 Checking role using Slack ID:", slack_user_id)
-
+# ==============================
+# Role-Based Access Control
+# ==============================
+def is_manager(slack_user_id):
     conn = get_connection()
     cur = conn.cursor()
 
@@ -44,43 +42,53 @@ def is_manager_by_slack_id(slack_user_id):
     """, (slack_user_id,))
 
     row = cur.fetchone()
-    print("🗂 DB Role Row:", row)
 
     cur.close()
     conn.close()
 
     return row and row[0].lower() == "manager"
 
-# -------------------------
-# PARSE DEADLINE
-# -------------------------
+# ==============================
+# Deadline Parser
+# ==============================
 def parse_deadline(text):
     try:
         return parser.parse(text, fuzzy=True).date()
     except:
         return None
 
-# -------------------------
-# AI EXTRACTION
-# -------------------------
-def extract_task_details(text):
+# ==============================
+# LLM Intent Detection
+# ==============================
+def extract_intent(text):
     response = groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[
             {
                 "role": "system",
                 "content": """
+You are a Slack workflow assistant.
+
 Return ONLY pure JSON.
-No explanation text.
+
+Possible intents:
+- assign_task
+- view_tasks
+- view_meetings
 
 Format:
 {
+  "intent": "",
   "member_name": "",
   "description": "",
   "deadline": ""
 }
 
-If deadline missing, leave empty.
+Rules:
+- If assigning → assign_task
+- If asking tasks → view_tasks
+- If asking meetings → view_meetings
+- Leave irrelevant fields empty
 """
             },
             {"role": "user", "content": text}
@@ -89,7 +97,6 @@ If deadline missing, leave empty.
     )
 
     raw = response.choices[0].message.content.strip()
-    print("🤖 AI RAW RESPONSE:", raw)
 
     try:
         return json.loads(raw)
@@ -97,16 +104,15 @@ If deadline missing, leave empty.
         return None
 
 # =====================================================
-# SLASH COMMAND: /assign (NAME-BASED)
+# SLASH COMMAND: /assign
 # =====================================================
 @app.command("/assign")
 def assign_task(ack, respond, command):
     ack()
-    print("⚡ Slash /assign Triggered")
 
     slack_user_id = command["user_id"]
 
-    if not is_manager_by_slack_id(slack_user_id):
+    if not is_manager(slack_user_id):
         respond("❌ Only Managers can assign tasks.")
         return
 
@@ -123,7 +129,6 @@ def assign_task(ack, respond, command):
     conn = get_connection()
     cur = conn.cursor()
 
-    # Lookup member_id from name
     cur.execute("""
         SELECT member_id FROM members
         WHERE member_name ILIKE %s
@@ -148,7 +153,7 @@ def assign_task(ack, respond, command):
     cur.close()
     conn.close()
 
-    respond(f"✅ Task assigned to {member_name} (Structured Mode).")
+    respond(f"✅ Task assigned to {member_name}.")
 
 # =====================================================
 # SLASH COMMAND: /tasks
@@ -156,7 +161,6 @@ def assign_task(ack, respond, command):
 @app.command("/tasks")
 def fetch_tasks(ack, respond, command):
     ack()
-    print("⚡ Slash /tasks Triggered")
 
     member_name = command["text"]
 
@@ -175,82 +179,145 @@ def fetch_tasks(ack, respond, command):
     if not rows:
         respond("No tasks found.")
     else:
-        msg = "*Tasks:*\n"
+        message = "*Tasks:*\n"
         for desc, deadline in rows:
-            msg += f"• {desc} (Deadline: {deadline})\n"
-        respond(msg)
+            message += f"• {desc} (Deadline: {deadline})\n"
+        respond(message)
 
     cur.close()
     conn.close()
 
 # =====================================================
-# AI NATURAL LANGUAGE: @mention
+# AI MODE: @Mention
 # =====================================================
 @app.event("app_mention")
-def handle_mention(body, say, client):
-    print("🔥 Mention Triggered")
-
+def handle_mention(body, say):
     slack_user_id = body["event"]["user"]
     text = body["event"]["text"]
 
-    if not is_manager_by_slack_id(slack_user_id):
-        say("❌ Only Managers can assign tasks.")
+    ai_data = extract_intent(text)
+
+    if not ai_data:
+        say("⚠️ I couldn't understand your request.")
         return
 
-    task_data = extract_task_details(text)
-
-    if not task_data:
-        say("⚠️ AI extraction failed.")
-        return
-
-    member_name = task_data.get("member_name", "")
-    description = task_data.get("description", "")
-    deadline_text = task_data.get("deadline", "")
-
-    if not member_name or not description:
-        say("⚠️ Could not extract task details.")
-        return
-
-    if not deadline_text:
-        deadline = datetime.today().date() + timedelta(days=3)
-    else:
-        deadline = parse_deadline(deadline_text)
-
-    if not deadline:
-        say("⚠️ Could not understand deadline.")
-        return
+    intent = ai_data.get("intent")
+    member_name = ai_data.get("member_name")
+    description = ai_data.get("description")
+    deadline_text = ai_data.get("deadline")
 
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT member_id FROM members
-        WHERE member_name ILIKE %s
-    """, (f"%{member_name}%",))
+    # ======================
+    # VIEW TASKS
+    # ======================
+    if intent == "view_tasks":
 
-    row = cur.fetchone()
+        if not member_name:
+            say("⚠️ Please specify a member name.")
+            return
 
-    if not row:
-        say("❌ Member not found.")
+        cur.execute("""
+            SELECT t.description, t.deadline
+            FROM tasks t
+            JOIN members m ON t.member_id = m.member_id
+            WHERE m.member_name ILIKE %s
+        """, (f"%{member_name}%",))
+
+        rows = cur.fetchall()
+
+        if not rows:
+            say(f"No tasks found for {member_name}.")
+        else:
+            message = f"*Tasks for {member_name}:*\n"
+            for desc, deadline in rows:
+                message += f"• {desc} (Deadline: {deadline})\n"
+            say(message)
+
         cur.close()
         conn.close()
         return
 
-    member_id = row[0]
+    # ======================
+    # VIEW MEETINGS
+    # ======================
+    if intent == "view_meetings":
 
-    cur.execute("""
-        INSERT INTO tasks (member_id, description, deadline)
-        VALUES (%s, %s, %s)
-    """, (member_id, description, deadline))
+        cur.execute("""
+            SELECT m.meeting_date, t.transcription_summary
+            FROM meetings m
+            JOIN transcription t ON m.transcription_id = t.transcription_id
+            ORDER BY m.meeting_date DESC
+        """)
 
-    conn.commit()
-    cur.close()
-    conn.close()
+        rows = cur.fetchall()
 
-    say(f"✅ Task assigned to {member_name} (AI Mode). Deadline: {deadline}")
+        if not rows:
+            say("No meeting summaries found.")
+        else:
+            message = "*Meeting Transcriptions:*\n\n"
+            for date, summary in rows:
+                message += f"*Date:* {date}\n{summary}\n\n"
+            say(message)
 
-# =====================================================
-# START SERVER
-# =====================================================
+        cur.close()
+        conn.close()
+        return
+
+    # ======================
+    # ASSIGN TASK
+    # ======================
+    if intent == "assign_task":
+
+        if not is_manager(slack_user_id):
+            say("❌ Only Managers can assign tasks.")
+            return
+
+        if not member_name or not description:
+            say("⚠️ Incomplete task details.")
+            return
+
+        if deadline_text:
+            deadline = parse_deadline(deadline_text)
+        else:
+            deadline = datetime.today().date() + timedelta(days=3)
+
+        if not deadline:
+            say("⚠️ Could not understand deadline.")
+            return
+
+        cur.execute("""
+            SELECT member_id FROM members
+            WHERE member_name ILIKE %s
+        """, (f"%{member_name}%",))
+
+        row = cur.fetchone()
+
+        if not row:
+            say("❌ Member not found.")
+            cur.close()
+            conn.close()
+            return
+
+        member_id = row[0]
+
+        cur.execute("""
+            INSERT INTO tasks (member_id, description, deadline)
+            VALUES (%s, %s, %s)
+        """, (member_id, description, deadline))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        say(f"✅ Task assigned to {member_name}. Deadline: {deadline}")
+        return
+
+    say("⚠️ I couldn't determine your request.")
+
+# ==============================
+# Start Server
+# ==============================
 if __name__ == "__main__":
     app.start(port=3000)
